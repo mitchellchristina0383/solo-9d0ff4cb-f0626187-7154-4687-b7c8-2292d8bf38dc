@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>并发写入观测台 · 隔离级别沙箱</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1f2430; --muted: #6b7280;
+    --line: #e3e6ea; --accent: #2563eb;
+    --ok: #15803d; --ok-bg: #dcfce7;
+    --warn: #b45309; --warn-bg: #fef3c7;
+    --bad: #b91c1c; --bad-bg: #fee2e2;
+    --neutral: #4b5563; --neutral-bg: #e5e7eb;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.55 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { padding: 18px 24px 6px; }
+  header h1 { font-size: 20px; margin: 0 0 4px; }
+  header p { margin: 0; color: var(--muted); }
+  main { padding: 12px 24px 40px; max-width: 1180px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+           padding: 14px 16px; margin-bottom: 16px; }
+  label.block { display: block; font-weight: 600; margin: 12px 0 4px; }
+  textarea { width: 100%; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+             border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+             background: #fbfbfc; resize: vertical; }
+  #initSql { min-height: 110px; } #script { min-height: 220px; } #checkSql { min-height: 56px; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+           padding: 7px 16px; font-size: 14px; cursor: pointer; }
+  button:disabled { opacity: .55; cursor: wait; }
+  button.secondary { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
+  select, input[type=number] { padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; }
+  input[type=number] { width: 72px; }
+  .hint { color: var(--muted); font-size: 12.5px; }
+  .hint code, code.inline { background: #eef1f5; border-radius: 4px; padding: 1px 5px;
+             font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+  .round { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+           padding: 14px 16px; margin-bottom: 16px; }
+  .round h2 { font-size: 16px; margin: 0 0 8px; display: flex; align-items: center; gap: 10px; }
+  .badge { display: inline-block; border-radius: 999px; padding: 1px 10px; font-size: 12px;
+           font-weight: 600; white-space: nowrap; }
+  .badge.ok { color: var(--ok); background: var(--ok-bg); }
+  .badge.warn { color: var(--warn); background: var(--warn-bg); }
+  .badge.bad { color: var(--bad); background: var(--bad-bg); }
+  .badge.neutral { color: var(--neutral); background: var(--neutral-bg); }
+  .outcomes { margin: 6px 0 10px; display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid var(--line); padding: 5px 8px; text-align: left;
+           vertical-align: top; font-size: 12.5px; }
+  th { background: #f1f3f6; font-weight: 600; }
+  td pre { margin: 0; white-space: pre-wrap; word-break: break-all;
+           font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+  .sess { font-weight: 700; } .sess.A { color: #7c3aed; } .sess.B { color: #0d9488; }
+  .sess.SYS { color: var(--muted); }
+  .err { color: var(--bad); } .muted { color: var(--muted); }
+  .mini { margin-top: 6px; } .mini th, .mini td { padding: 2px 6px; font-size: 12px; }
+  h3.sub { font-size: 14px; margin: 14px 0 6px; }
+  #status { color: var(--muted); }
+  .error-banner { background: var(--bad-bg); color: var(--bad); border: 1px solid var(--bad);
+                  border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>并发写入观测台</h1>
+  <p>同一组双会话交错 SQL，从相同初始数据出发，分别在 <b>READ COMMITTED</b> 与
+     <b>SERIALIZABLE</b> 下各跑一轮，对比事务结局与最终数据。改隔离级别之前，先看看数据会变成什么样。</p>
+</header>
+<main>
+  <section class="panel">
+    <div class="row" style="margin-top:0">
+      <label for="preset"><b>样例：</b></label>
+      <select id="preset"></select>
+      <button type="button" class="secondary" id="loadPreset">载入</button>
+      <span class="hint" id="presetDesc"></span>
+    </div>
+
+    <label class="block" for="initSql">初始数据 SQL（每轮开始前执行，可多条语句；两轮各自重置）</label>
+    <textarea id="initSql" spellcheck="false"></textarea>
+
+    <label class="block" for="script">交错脚本</label>
+    <textarea id="script" spellcheck="false"></textarea>
+    <div class="hint">
+      每步一个头部：<code>@A complete</code>（等语句完成，默认）或
+      <code>@B blocked</code>（等数据库确认被另一会话阻塞即推进，语句留在后台，持锁会话可继续 COMMIT）。
+      头部之下到下一个头部之间是该步的 SQL。事务由引擎按本轮隔离级别自动 BEGIN，脚本里用
+      <code>COMMIT</code> / <code>ROLLBACK</code> 收尾；脚本结束仍未提交的事务会被回滚。
+    </div>
+
+    <label class="block" for="checkSql">核对查询（两轮事务都结束后，在新连接上执行）</label>
+    <textarea id="checkSql" spellcheck="false"></textarea>
+
+    <div class="row">
+      <label for="timeout">每轮超时（秒）：</label>
+      <input id="timeout" type="number" min="1" max="60" step="1" value="5">
+      <button type="button" id="run">运行（两种隔离级别各一轮）</button>
+      <span id="status"></span>
+    </div>
+  </section>
+
+  <section id="results"></section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let presets = [];
+
+const KIND_LABELS = {
+  reset: "重置初始数据",
+  begin: "开始事务",
+  step_start: "执行",
+  step_ok: "完成",
+  step_error: "出错",
+  blocked: "确认被阻塞，推进",
+  no_block: "未阻塞（直接完成）",
+  rollback: "引擎回滚",
+  rollback_error: "回滚失败",
+  timeout: "超时，结束本轮",
+  check: "核对查询",
+  round_error: "本轮出错",
+};
+const OUTCOME_LABELS = {
+  committed: ["已提交", "ok"],
+  rolled_back: ["已回滚", "neutral"],
+  aborted: ["已中止", "bad"],
+  unknown: ["未知", "neutral"],
+};
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined && text !== null) node.textContent = text;
+  return node;
+}
+
+function sqlBlock(sql) {
+  const pre = el("pre");
+  pre.textContent = sql;
+  return pre;
+}
+
+function rowsTable(columns, rows) {
+  const table = el("table", "mini");
+  const trh = el("tr");
+  columns.forEach((c) => trh.appendChild(el("th", null, c)));
+  table.appendChild(trh);
+  rows.forEach((r) => {
+    const tr = el("tr");
+    r.forEach((v) => tr.appendChild(el("td", null, v === null ? "NULL" : String(v))));
+    table.appendChild(tr);
+  });
+  return table;
+}
+
+function renderEvent(ev) {
+  const tr = el("tr");
+  tr.appendChild(el("td", null, ev.t.toFixed(3) + "s"));
+  tr.appendChild(el("td", "sess " + ev.session, ev.session));
+  let label = KIND_LABELS[ev.kind] || ev.kind;
+  if (ev.kind === "step_ok" && ev.after_blocked) label = "解除阻塞后完成";
+  if (ev.kind === "step_error" && ev.after_blocked) label = "解除阻塞后出错";
+  tr.appendChild(el("td", null, label));
+
+  const td = el("td");
+  if (ev.sql) td.appendChild(sqlBlock(ev.sql));
+  if (ev.kind === "step_start" && ev.mode) {
+    td.appendChild(el("div", "muted", "模式：" + ev.mode));
+  }
+  if (ev.status) td.appendChild(el("div", "muted", "→ " + ev.status));
+  if (ev.error) td.appendChild(el("div", "err", (ev.pgcode ? ev.pgcode + " " : "") + ev.error));
+  if (ev.kind === "blocked") {
+    td.appendChild(el("div", null,
+      "阻塞者 pid：" + (ev.blockers || []).join(", ") +
+      (ev.by_other ? "（正是另一会话）" : "（不是另一会话！）")));
+  }
+  if (ev.detail) td.appendChild(el("div", "muted", ev.detail));
+  if (ev.columns && ev.rows) td.appendChild(rowsTable(ev.columns, ev.rows));
+  tr.appendChild(td);
+  return tr;
+}
+
+function renderRound(round) {
+  const box = el("div", "round");
+  const h2 = el("h2");
+  h2.appendChild(el("span", null, round.isolation));
+  if (round.error) {
+    h2.appendChild(el("span", "badge bad", "本轮出错"));
+  } else if (round.timed_out) {
+    h2.appendChild(el("span", "badge warn", "超时结束"));
+  } else {
+    h2.appendChild(el("span", "badge ok", "正常完成"));
+  }
+  h2.appendChild(el("span", "muted", "耗时 " + round.duration + "s"));
+  box.appendChild(h2);
+
+  if (round.error) {
+    box.appendChild(el("div", "error-banner", round.error));
+  }
+
+  const names = Object.keys(round.outcomes || {}).sort();
+  if (names.length) {
+    const oc = el("div", "outcomes");
+    oc.appendChild(el("b", null, "事务结局："));
+    names.forEach((n) => {
+      const o = round.outcomes[n];
+      const [text, cls] = OUTCOME_LABELS[o.outcome] || OUTCOME_LABELS.unknown;
+      const span = el("span");
+      span.appendChild(el("span", "sess " + n, n + " "));
+      span.appendChild(el("span", "badge " + cls, text));
+      if (o.note) span.appendChild(el("span", "muted", " " + o.note));
+      oc.appendChild(span);
+    });
+    box.appendChild(oc);
+  }
+
+  box.appendChild(el("h3", "sub", "执行时间线"));
+  const tl = el("table");
+  const head = el("tr");
+  ["时间", "会话", "事件", "SQL / 详情"].forEach((t) => head.appendChild(el("th", null, t)));
+  tl.appendChild(head);
+  round.events.forEach((ev) => tl.appendChild(renderEvent(ev)));
+  box.appendChild(tl);
+
+  if (round.check) {
+    box.appendChild(el("h3", "sub", "核对查询结果"));
+    if (round.check.error) {
+      box.appendChild(el("div", "error-banner",
+        (round.check.pgcode ? round.check.pgcode + " " : "") + round.check.error));
+    } else if (round.check.columns) {
+      box.appendChild(rowsTable(round.check.columns, round.check.rows));
+    } else {
+      box.appendChild(el("div", "muted", "→ " + (round.check.status || "（无结果集）")));
+    }
+  }
+  return box;
+}
+
+async function loadPresets() {
+  const resp = await fetch("/api/presets");
+  presets = await resp.json();
+  const sel = $("preset");
+  presets.forEach((p, i) => {
+    const opt = el("option", null, p.name);
+    opt.value = i;
+    sel.appendChild(opt);
+  });
+  if (presets.length) fillPreset(0);
+}
+
+function fillPreset(i) {
+  const p = presets[i];
+  if (!p) return;
+  $("initSql").value = p.init_sql;
+  $("script").value = p.script;
+  $("checkSql").value = p.check_sql;
+  $("presetDesc").textContent = p.description;
+}
+
+async function run() {
+  $("run").disabled = true;
+  $("status").textContent = "运行中……";
+  $("results").textContent = "";
+  try {
+    const resp = await fetch("/api/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        init_sql: $("initSql").value,
+        script: $("script").value,
+        check_sql: $("checkSql").value,
+        timeout_s: parseFloat($("timeout").value) || 5,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      $("results").appendChild(el("div", "error-banner", data.error || ("HTTP " + resp.status)));
+      return;
+    }
+    data.rounds.forEach((r) => $("results").appendChild(renderRound(r)));
+  } catch (e) {
+    $("results").appendChild(el("div", "error-banner", String(e)));
+  } finally {
+    $("run").disabled = false;
+    $("status").textContent = "";
+  }
+}
+
+$("loadPreset").addEventListener("click", () => fillPreset(Number($("preset").value)));
+$("preset").addEventListener("change", () => fillPreset(Number($("preset").value)));
+$("run").addEventListener("click", run);
+loadPresets().catch((e) => { $("status").textContent = "样例加载失败：" + e; });
+</script>
+</body>
+</html>

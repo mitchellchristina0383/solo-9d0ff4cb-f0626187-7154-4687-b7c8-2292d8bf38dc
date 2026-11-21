@@ -1,0 +1,30 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: sandbox
+      POSTGRES_DB: sandbox
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sandbox"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    # 纯沙箱：数据每轮都会被“初始数据 SQL”重置，不挂卷，删掉容器即清空
+
+  web:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: sandbox
+      PGUSER: postgres
+      PGPASSWORD: sandbox
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
