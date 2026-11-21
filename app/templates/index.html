@@ -116,10 +116,16 @@ const KIND_LABELS = {
   step_error: "出错",
   blocked: "确认被阻塞，推进",
   no_block: "未阻塞（直接完成）",
+  cancel: "取消在飞语句",
   rollback: "引擎回滚",
   rollback_error: "回滚失败",
+  cleanup_ok: "会话已停止，清理完成",
+  cleanup_error: "清理失败",
+  terminate_backend: "强制终止会话",
+  close_error: "关闭连接失败",
   timeout: "超时，结束本轮",
   check: "核对查询",
+  check_skipped: "跳过核对",
   round_error: "本轮出错",
 };
 const OUTCOME_LABELS = {
@@ -127,6 +133,14 @@ const OUTCOME_LABELS = {
   rolled_back: ["已回滚", "neutral"],
   aborted: ["已中止", "bad"],
   unknown: ["未知", "neutral"],
+};
+const EVENT_STYLES = {
+  cancel: "err",
+  cleanup_error: "err",
+  rollback_error: "err",
+  close_error: "err",
+  check_skipped: "err",
+  terminate_backend: "warn",
 };
 
 function el(tag, cls, text) {
@@ -162,7 +176,12 @@ function renderEvent(ev) {
   let label = KIND_LABELS[ev.kind] || ev.kind;
   if (ev.kind === "step_ok" && ev.after_blocked) label = "解除阻塞后完成";
   if (ev.kind === "step_error" && ev.after_blocked) label = "解除阻塞后出错";
-  tr.appendChild(el("td", null, label));
+  if (ev.kind === "step_error" && ev.cancelled) {
+    label = ev.pgcode === "57014" ? "语句被取消（未提交）" : "取消未生效，已终止连接";
+  }
+  const cellCls = EVENT_STYLES[ev.kind];
+  const evTd = el("td", cellCls, label);
+  tr.appendChild(evTd);
 
   const td = el("td");
   if (ev.sql) td.appendChild(sqlBlock(ev.sql));
@@ -171,6 +190,11 @@ function renderEvent(ev) {
   }
   if (ev.status) td.appendChild(el("div", "muted", "→ " + ev.status));
   if (ev.error) td.appendChild(el("div", "err", (ev.pgcode ? ev.pgcode + " " : "") + ev.error));
+  if (ev.kind === "step_error" && ev.cancelled) {
+    td.appendChild(el("div", "err", ev.pgcode === "57014"
+      ? "该批次随取消中止，服务器已回滚其事务，不会在收尾时提交"
+      : "取消未生效，已强制终止该会话；其未提交事务由服务器回滚"));
+  }
   if (ev.kind === "blocked") {
     td.appendChild(el("div", null,
       "阻塞者 pid：" + (ev.blockers || []).join(", ") +
@@ -180,6 +204,17 @@ function renderEvent(ev) {
   if (ev.columns && ev.rows) td.appendChild(rowsTable(ev.columns, ev.rows));
   tr.appendChild(td);
   return tr;
+}
+
+function renderSkippedRound(round) {
+  const box = el("div", "round");
+  const h2 = el("h2");
+  h2.appendChild(el("span", null, round.isolation));
+  h2.appendChild(el("span", "badge bad", "未运行"));
+  box.appendChild(h2);
+  box.appendChild(el("div", "error-banner",
+    "未启动本轮的试跑：" + (round.skip_reason || "前一轮清理失败")));
+  return box;
 }
 
 function renderRound(round) {
@@ -193,11 +228,25 @@ function renderRound(round) {
   } else {
     h2.appendChild(el("span", "badge ok", "正常完成"));
   }
+  const cleanup = round.cleanup || {};
+  if (round.check_skipped) {
+    h2.appendChild(el("span", "badge bad", "未核对"));
+  }
   h2.appendChild(el("span", "muted", "耗时 " + round.duration + "s"));
   box.appendChild(h2);
 
   if (round.error) {
     box.appendChild(el("div", "error-banner", round.error));
+  }
+  if (cleanup.terminated && cleanup.terminated.length) {
+    box.appendChild(el("div", "error-banner",
+      "收尾时取消了在飞语句仍未能停止，已强制终止会话：" +
+      cleanup.terminated.join(", ") + "（其未提交事务已由服务器回滚）"));
+  }
+  if (!cleanup.ok) {
+    box.appendChild(el("div", "error-banner",
+      "清理失败：" + (cleanup.errors || []).join("；") +
+      "。已跳过核对查询与后续轮次，请检查数据库会话后再运行。"));
   }
 
   const names = Object.keys(round.outcomes || {}).sort();
@@ -224,6 +273,14 @@ function renderRound(round) {
   round.events.forEach((ev) => tl.appendChild(renderEvent(ev)));
   box.appendChild(tl);
 
+  if (round.check_skipped) {
+    box.appendChild(el("h3", "sub", "核对查询结果"));
+    box.appendChild(el("div", "error-banner",
+      cleanup.ok
+        ? "本轮未能完成清理，核对查询已跳过。"
+        : "本轮清理未完成，核对查询已跳过（数据可能仍受残留会话影响）。"));
+    return box;
+  }
   if (round.check) {
     box.appendChild(el("h3", "sub", "核对查询结果"));
     if (round.check.error) {
@@ -279,7 +336,13 @@ async function run() {
       $("results").appendChild(el("div", "error-banner", data.error || ("HTTP " + resp.status)));
       return;
     }
-    data.rounds.forEach((r) => $("results").appendChild(renderRound(r)));
+    data.rounds.forEach((r) => {
+      $("results").appendChild(r.skipped ? renderSkippedRound(r) : renderRound(r));
+    });
+    const cleanupFailed = data.rounds.some((r) => r.cleanup && !r.cleanup.ok);
+    if (cleanupFailed) {
+      $("status").textContent = "清理未完成，已跳过核对与后续轮次";
+    }
   } catch (e) {
     $("results").appendChild(el("div", "error-banner", String(e)));
   } finally {

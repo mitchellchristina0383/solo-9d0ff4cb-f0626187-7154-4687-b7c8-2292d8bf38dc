@@ -1,4 +1,5 @@
-"""端到端自测：写偏斜（撤班样例）、锁等待、超时回滚与重跑、blocked 未阻塞分支。
+"""端到端自测：写偏斜（撤班样例）、锁等待、超时回滚与重跑、超时批次不得被收尾提交、
+清理失败短路、blocked 未阻塞分支。
 
 用法：
   docker compose up -d --build 之后：
@@ -130,17 +131,167 @@ def test_timeout_and_rerun():
               rnd["outcomes"]["A"]["outcome"] == "rolled_back"
               and rnd["outcomes"]["B"]["outcome"] == "rolled_back",
               str(rnd["outcomes"]))
+        check(f"{name} 清理成功", rnd["cleanup"]["ok"] and not rnd["check_skipped"],
+              str(rnd["cleanup"]))
         bal = check_value(rnd["check"]["rows"], "balance", rnd["check"]["columns"])
         check(f"{name} 余额保持 1000（未提交的全部回滚）", bal == 1000, f"got {bal}")
     cancelled = any(e["kind"] == "step_error" and e.get("pgcode") == "57014"
                     for e in rc["events"])
     check("RC 时间线出现语句被取消（57014）", cancelled)
+    check("时间线标出取消动作",
+          any(e["kind"] == "cancel" for e in rc["events"]))
+    check("清理完成事件记在时间线上",
+          any(e["kind"] == "cleanup_ok" for e in rc["events"]))
 
     # 超时之后立刻重跑另一组实验：仍应从初始数据开始并正常完成
     rc2, _ = run_preset("lock-wait")
     bal2 = check_value(rc2["check"]["rows"], "balance", rc2["check"]["columns"])
     check("超时后重跑仍从初始数据开始（锁等待样例 RC 余额 = 700）",
           not rc2["timed_out"] and bal2 == 700, f"got {bal2}")
+
+
+def test_timeout_pending_batch_must_not_commit():
+    """回归：超时时仍在等锁的多语句批次，不能因收尾释放行锁而提交。
+
+    A 持行锁，B 用 blocked 模式执行“两条 UPDATE + COMMIT”（已确认被 A 阻塞），
+    随后 A 的 pg_sleep 拖到超时。旧收尾先回滚 A（释放锁），B 的批次继续执行
+    并 COMMIT——超时批次被“收尾”提交，核对会看到 750。
+    """
+    print("== 回归：超时批次不得被收尾提交 ==")
+    init = preset("lock-wait")["init_sql"]
+    script = """@A complete
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+
+@B blocked
+UPDATE accounts SET balance = balance - 200 WHERE id = 1;
+UPDATE accounts SET balance = balance - 50 WHERE id = 1;
+COMMIT;
+
+@A complete
+SELECT pg_sleep(10);"""
+    steps = parse_script(script)
+    for rnd in run_experiment(conninfo(), init, steps,
+                              "SELECT balance FROM accounts WHERE id = 1;", 2.0):
+        iso = rnd["isolation"]
+        check(f"{iso} 判定为超时", rnd["timed_out"], str(rnd.get("error")))
+        check(f"{iso} B 的批次被取消而不是提交",
+              rnd["outcomes"]["B"]["outcome"] == "rolled_back",
+              str(rnd["outcomes"]))
+        check(f"{iso} 时间线出现 B 的取消（57014）",
+              any(e["kind"] == "step_error" and e["session"] == "B"
+                  and e.get("pgcode") == "57014" and e.get("cancelled")
+                  for e in rnd["events"]),
+              str([(e["session"], e["kind"], e.get("pgcode")) for e in rnd["events"]]))
+        check(f"{iso} 清理成功且完成核对",
+              rnd["cleanup"]["ok"] and not rnd["check_skipped"], str(rnd["cleanup"]))
+        bal = check_value(rnd["check"]["rows"], "balance", rnd["check"]["columns"])
+        check(f"{iso} 余额保持 1000（超时批次未提交）", bal == 1000, f"got {bal}")
+        check(f"{iso} 无会话残留（核对前已停止）",
+              rnd["cleanup"]["ok"] and not rnd["cleanup"]["terminated"],
+              str(rnd["cleanup"]))
+
+
+def test_cleanup_failure_short_circuits():
+    """清理失败时：页面可提示，且不核对、不启动后续轮次。"""
+    print("== 清理失败：跳过核对与后续轮次 ==")
+    import engine
+
+    real = engine._cleanup_sessions
+
+    def broken_cleanup(ctl, sessions, timed_out, log):
+        out = real(ctl, sessions, timed_out, log)
+        out["ok"] = False
+        out["errors"].append("模拟清理失败")
+        return out
+
+    engine._cleanup_sessions = broken_cleanup
+    try:
+        p = preset("lock-wait")
+        rounds = engine.run_experiment(
+            conninfo(), p["init_sql"], parse_script(p["script"]), p["check_sql"], 6.0)
+    finally:
+        engine._cleanup_sessions = real
+
+    check("只返回两轮（第一轮清理失败后不再启动）", len(rounds) == 2, str(len(rounds)))
+    check("第一轮标记清理失败", not rounds[0]["cleanup"]["ok"], str(rounds[0]["cleanup"]))
+    check("第一轮跳过核对", rounds[0]["check_skipped"] and rounds[0]["check"] is None)
+    check("第二轮被标记为未运行", rounds[1].get("skipped") is True, str(rounds[1].get("skipped")))
+    check("第二轮没有事件、没有核对",
+          not rounds[1]["events"] and rounds[1]["check"] is None)
+    check("第二轮说明未启动的原因",
+          "清理失败" in (rounds[1].get("skip_reason") or ""), str(rounds[1].get("skip_reason")))
+
+    # 失败后重跑仍能工作（没有残留会话）
+    rc, _ = run_preset("lock-wait")
+    bal = check_value(rc["check"]["rows"], "balance", rc["check"]["columns"])
+    check("清理失败记录后重跑仍从初始数据开始（余额 = 700）",
+          not rc["timed_out"] and rc["cleanup"]["ok"] and bal == 700, f"got {bal}")
+
+
+def test_inflight_cancel_is_final():
+    """直接验证服务器行为：取消等锁中的多语句批次后，释放行锁也不提交。"""
+    print("== 取消在飞批次后立即释放锁 ==")
+    import psycopg2
+    import threading
+    import time
+
+    ci = conninfo()
+    ctl = psycopg2.connect(**ci)
+    ctl.autocommit = True
+    try:
+        cur = ctl.cursor()
+        cur.execute("DROP TABLE IF EXISTS cancel_probe;"
+                    "CREATE TABLE cancel_probe (id int PRIMARY KEY, v int NOT NULL);"
+                    "INSERT INTO cancel_probe VALUES (1, 0);")
+        cur.close()
+        holder = psycopg2.connect(**ci)
+        waiter = psycopg2.connect(**ci)
+        holder.autocommit = True
+        waiter.autocommit = True
+        try:
+            hc = holder.cursor()
+            hc.execute("BEGIN")
+            hc.execute("UPDATE cancel_probe SET v = v + 1 WHERE id = 1")
+            state = {}
+
+            def work():
+                try:
+                    wc = waiter.cursor()
+                    wc.execute("UPDATE cancel_probe SET v = v + 10 WHERE id = 1;"
+                               "UPDATE cancel_probe SET v = v + 100 WHERE id = 1;"
+                               "COMMIT;")
+                    state["status"] = wc.statusmessage
+                except Exception as exc:  # 期望 57014
+                    state["error"] = exc
+
+            thread = threading.Thread(target=work, daemon=True)
+            thread.start()
+            pid = waiter.get_backend_pid()
+            for _ in range(200):
+                pc = ctl.cursor()
+                pc.execute("SELECT pg_blocking_pids(%s)", (pid,))
+                if pc.fetchone()[0]:
+                    pc.close()
+                    break
+                pc.close()
+                time.sleep(0.01)
+            waiter.cancel()
+            hc.execute("ROLLBACK")  # 立刻释放行锁
+            thread.join(5)
+            err = state.get("error")
+            check("批次因取消而中止（57014），没有执行到 COMMIT",
+                  getattr(err, "pgcode", None) == "57014" and "status" not in state,
+                  str(state))
+            pc = ctl.cursor()
+            pc.execute("SELECT v FROM cancel_probe WHERE id = 1")
+            value = pc.fetchone()[0]
+            pc.close()
+            check("取消后即使锁被释放，数据也未被批次提交（v = 0）", value == 0, f"got {value}")
+        finally:
+            holder.close()
+            waiter.close()
+    finally:
+        ctl.close()
 
 
 def test_no_block_branch():
@@ -166,6 +317,9 @@ def main():
     test_write_skew()
     test_lock_wait()
     test_timeout_and_rerun()
+    test_timeout_pending_batch_must_not_commit()
+    test_cleanup_failure_short_circuits()
+    test_inflight_cancel_is_final()
     test_no_block_branch()
     print()
     if FAILURES:
